@@ -2,121 +2,118 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <time.h>
+#include <signal.h>
 #include <sys/wait.h>
+#include <sys/types.h>
 
-#define ROUNDS 10
-
-typedef struct {
-    int round_num;
-    int max_number;
-    int is_thinker;
-} RoundInfo;
-
-void play_round(int read_fd, int write_fd, RoundInfo info) {
-    if (info.is_thinker) {
-        // Процесс-загадыватель
-        int target = rand() % info.max_number + 1;
-        printf("Раунд %d: загадано число от 1 до %d\n", info.round_num, info.max_number);
-        fflush(stdout);  // Обеспечиваем немедленный вывод
-        
-        while (1) {
-            int guess;
-            read(read_fd, &guess, sizeof(guess));
-            
-            if (guess == target) {
-                printf("Раунд %d: число %d угадано за %d попыток\n", 
-                      info.round_num, guess, guess);
-                fflush(stdout);
-                int response = 1;
-                write(write_fd, &response, sizeof(response));
-                break;
-            } else {
-                int response = 0;
-                write(write_fd, &response, sizeof(response));
-            }
-        }
-    } else {
-        // Процесс-угадыватель
-        for (int guess = 1; guess <= info.max_number; guess++) {
-            write(write_fd, &guess, sizeof(guess));
-            
-            int response;
-            read(read_fd, &response, sizeof(response));
-            
-            if (response == 1) break;
-        }
-    }
+void handler(int sig, siginfo_t *info, void *context){
+        printf("Игра начинается\n");
 }
 
-int main(int argc, char* argv[]) {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <max_number>\n", argv[0]);
-        return 1;
+void player1(pid_t pid, int i, int n, sigset_t set, sigset_t oldset, const struct timespec *timeout);
+void player2(pid_t pid, int i, int n, sigset_t set, const struct timespec *timeout);
+
+int main(int argc, char* argv[]){
+    pid_t pid = fork();
+    if (pid < 0){
+	perror("fork error");
+	exit(1);
     }
 
-    int max_number = atoi(argv[1]);
-    if (max_number <= 1) {
-        fprintf(stderr, "Number must be greater than 1\n");
-        return 1;
-    }
+    int n = atoi(argv[1]);
+
+    sigset_t set, oldset;
+    sigemptyset(&set);
+    sigaddset(&set, SIGUSR1);
+    sigaddset(&set, SIGUSR2);
+    sigaddset(&set, SIGRTMIN);
+    sigaddset(&set, SIGRTMIN+1);
+    sigprocmask(SIG_BLOCK, &set, &oldset);
+    
+    struct sigaction act;
+    act.sa_flags = SA_SIGINFO;
+    act.sa_sigaction = handler;
+    act.sa_mask = set;
+    if (sigaction(SIGRTMIN, &act, 0) == -1)
+	perror("can't catch");
 
     srand(time(NULL));
+    struct timespec timeout = {1, 0};
 
-    // Каналы для четных и нечетных раундов
-    int pipes_even[2];    // Для четных раундов
-    int pipes_odd[2];     // Для нечетных раундов
-    
-    if (pipe(pipes_even) || pipe(pipes_odd)) {
-        perror("pipe");
-        return 1;
+    for (int i = 1; i <= 10; i++){
+        if (i%2 == 1){
+	    if (pid > 0)
+	        player2(pid, i, n, set, &timeout);
+
+	    else
+	        player1(getppid(), i, n, set, oldset, &timeout);
+	}
+	
+	else {
+	    if (pid > 0)
+	        player1(pid, i, n, set, oldset, &timeout);
+
+	    else
+	        player2(getppid(), i, n, set, &timeout);
+	}
     }
 
-    pid_t pid = fork();
-    if (pid < 0) {
-        perror("fork");
-        return 1;
-    }
-
-    for (int round = 1; round <= ROUNDS; round++) {
-        RoundInfo info = {round, max_number, round % 2};
-        
-        if (pid == 0) { // Дочерний процесс
-            if (round % 2) {
-                // Нечетный раунд - ребенок угадывает
-                close(pipes_odd[1]);
-                close(pipes_even[0]);
-                play_round(pipes_odd[0], pipes_even[1], info);
-            } else {
-                // Четный раунд - ребенок загадывает
-                close(pipes_odd[0]);
-                close(pipes_even[1]);
-                info.is_thinker = 1;
-                play_round(pipes_even[0], pipes_odd[1], info);
-            }
-        } else { // Родительский процесс
-            if (round % 2) {
-                // Нечетный раунд - родитель загадывает
-                close(pipes_odd[0]);
-                close(pipes_even[1]);
-                info.is_thinker = 1;
-                play_round(pipes_even[0], pipes_odd[1], info);
-            } else {
-                // Четный раунд - родитель угадывает
-                close(pipes_odd[1]);
-                close(pipes_even[0]);
-                info.is_thinker = 0;
-                play_round(pipes_odd[0], pipes_even[1], info);
-            }
-        }
-    }
-
-    if (pid > 0) {
-        close(pipes_odd[0]);
-        close(pipes_odd[1]);
-        close(pipes_even[0]);
-        close(pipes_even[1]);
-        wait(NULL);
-    }
-
+    int status;
+    if (pid > 0)
+	waitpid(pid, &status, 0);
+ 
     return 0;
+}
+
+
+void player1(pid_t pid, int i, int n, sigset_t set, sigset_t oldset, const struct timespec *timeout){
+    siginfo_t si;
+    sigtimedwait(&set, &si, timeout);
+    
+    int guess = 0;
+    while (1){
+        guess++;
+        union sigval value;
+        value.sival_int = guess;
+        sigqueue(pid, SIGRTMIN+1, value);
+        int sig = sigtimedwait(&set, &si, timeout);
+        if (sig == SIGUSR1)
+            break;
+        else if (sig == SIGUSR2)
+            continue;
+        }
+
+}
+
+void player2(pid_t pid, int i, int n, sigset_t set, const struct timespec *timeout){
+    int target = rand() % n + 1;
+    int attempt = 0;
+    printf("Раунд %d:\n", i);
+    printf("Процесс %d загадывает число от 1 до %d\n", getpid(), n);
+    if (kill(pid, SIGRTMIN) < 0){
+        perror("kill");
+        exit(1);
+    }
+    int sig;
+    while (1){
+        siginfo_t si; 
+	sig = sigtimedwait(&set, &si, timeout);
+
+	if (sig == SIGRTMIN+1){
+	    int guess = si.si_value.sival_int;
+	    attempt++;
+	    printf("\tПопытка %d: %d\n", attempt,  guess);
+	    if (guess == target){
+	        kill(pid, SIGUSR1);
+		printf("Раунд %d завершён\nКоличество попыток: %d\n", i, attempt);
+		break;
+	    }
+	    else
+		kill(pid, SIGUSR2);
+         }
+
+	else if (sig == -1){
+	    exit(1);
+	}
+    }
 }
